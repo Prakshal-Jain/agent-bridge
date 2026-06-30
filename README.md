@@ -33,6 +33,10 @@ to make a session react the instant a message arrives is to keep it **parked in
 `bridge_wait`**, which is now event-driven (`fs.watch`) and returns within
 milliseconds of a post — no busy-polling.
 
+There are two ways to do this.
+
+### A) In an interactive session (no extra process)
+
 Tell your agent to loop:
 
 > Watch the `zero-ui-debate` channel. Call `bridge_wait(channel="zero-ui-debate", since=<lastSeq>)`.
@@ -44,6 +48,36 @@ Tell your agent to loop:
 The session now wakes and acts on every new message on its own — the human only
 starts the loop once. (Each `bridge_wait` blocks up to `timeout_ms`, default
 60s, max 10min; the loop simply re-arms it, so the watch is continuous.)
+
+### B) As a background daemon — `watch.js`
+
+`watch.js` encodes the trigger so you don't paste a loop prompt: it `fs.watch`es
+a channel and runs **a command of your choice for every new message**. Point that
+command at a headless agent and you get a hands-off auto-responder.
+
+```bash
+# Whenever someone other than "claude" posts to zero-ui-debate,
+# spawn a headless Claude to read context and post a reply:
+node watch.js zero-ui-debate --from claude -- ./examples/respond-with-claude.sh
+```
+
+- `--from <me>` skips your own posts, so the responder never triggers on its own
+  replies (no infinite loop). **Always set it.**
+- Each fire gets the message via env (`BRIDGE_CHANNEL`, `BRIDGE_SEQ`,
+  `BRIDGE_FROM`, `BRIDGE_BODY`, `BRIDGE_TS`) and as JSON on stdin.
+- Messages are handled one at a time (next waits for the current command to
+  exit), and progress is persisted next to the channel, so a restart resumes
+  instead of replaying. Use `--replay` to process existing history first.
+
+`examples/respond-with-claude.sh` is a ready template that calls `claude -p` with
+this server attached so it can `bridge_post` the reply itself — adapt the prompt,
+model, or swap in `grok` for the other side.
+
+> Note the boundary: a daemon spawning a fresh responder per message is the
+> closest you can get to "trigger the session." An MCP server still cannot inject
+> a turn into an *already-running, idle* interactive session — nothing can, for a
+> generic CLI. Option A keeps one session live; option B starts a worker per
+> message.
 
 ## Setup (one time)
 
@@ -89,6 +123,8 @@ the moment the other posts.
 ## Folders
 
 - `server.js` — the MCP relay
+- `watch.js` — background daemon that runs a command on every new message ([watch mode B](#b-as-a-background-daemon--watchjs))
+- `examples/` — ready-to-edit responder templates for `watch.js`
 - `data/` — channel logs (gitignored)
 - `debate/` — the briefing prompt + the seeded strategy position
 - `articles/` — shared drafting workspace for the campaign deliverables
