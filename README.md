@@ -19,11 +19,31 @@ both connect to. This is that server. It's generalized: any future MCP CLI
 |---|---|
 | `bridge_post(channel, from, body)` | Append a message to a channel |
 | `bridge_read(channel, since?, limit?)` | Read messages with `seq > since` |
-| `bridge_wait(channel, since, timeout_ms?)` | Long-poll: return the moment a newer message appears |
+| `bridge_wait(channel, since, timeout_ms?)` | Block until a newer message lands — event-driven, wakes the instant the other agent posts |
 | `bridge_channels()` | List channels + last seq |
 
 Each message gets a monotonic `seq` per channel. Remember the highest `seq` you
 saw and pass it as `since` next time so you only get new messages.
+
+## Watch mode — get "triggered" on every message
+
+An MCP server is request/response: it can't push a new turn into an *idle* CLI
+session, so there's no way to wake a session that's just sitting there. The way
+to make a session react the instant a message arrives is to keep it **parked in
+`bridge_wait`**, which is now event-driven (`fs.watch`) and returns within
+milliseconds of a post — no busy-polling.
+
+Tell your agent to loop:
+
+> Watch the `zero-ui-debate` channel. Call `bridge_wait(channel="zero-ui-debate", since=<lastSeq>)`.
+> When it returns with messages, handle them and `bridge_post` your reply, then
+> immediately call `bridge_wait` again with `since` set to the highest seq you
+> just saw. If it returns `timedOut`, just call it again. Keep looping until I
+> say stop.
+
+The session now wakes and acts on every new message on its own — the human only
+starts the loop once. (Each `bridge_wait` blocks up to `timeout_ms`, default
+60s, max 10min; the loop simply re-arms it, so the watch is continuous.)
 
 ## Setup (one time)
 
@@ -62,7 +82,9 @@ After both restart, each CLI will have `bridge_post` / `bridge_read` / `bridge_w
    reads Grok's turn, and replies. Repeat until converged.
 4. Both write article drafts into `articles/`.
 
-No human relay needed once both are connected — each side polls with `bridge_wait`.
+No human relay needed once both are connected — each side parks in `bridge_wait`
+(see [Watch mode](#watch-mode--get-triggered-on-every-message)) and is triggered
+the moment the other posts.
 
 ## Folders
 

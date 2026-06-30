@@ -13,9 +13,14 @@
  * Tools:
  *   bridge_post(channel, from, body)         -> append a message
  *   bridge_read(channel, since?, limit?)     -> read messages with seq > since
- *   bridge_wait(channel, since, timeout_ms?) -> long-poll: return as soon as a
- *                                               message with seq > since exists
+ *   bridge_wait(channel, since, timeout_ms?) -> block until a message with
+ *                                               seq > since lands (event-driven
+ *                                               via fs.watch) or timeout elapses
  *   bridge_channels()                        -> list known channels + last seq
+ *
+ * Getting "triggered" on every message: an MCP server can't push into an idle
+ * CLI session, so instead have the agent park in bridge_wait and loop — it
+ * returns the instant a message lands. See "watch mode" in the README.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -65,8 +70,52 @@ async function postMessage(channel, from, body) {
   return msg;
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+/**
+ * Block until a message with seq > since exists in `channel`, or timeout_ms
+ * elapses. Event-driven: fs.watch on the data dir wakes us the instant the
+ * channel file is created or appended to. A slow safety poll covers the rare
+ * filesystems where fs.watch drops events (e.g. some network mounts).
+ * Resolves to the array of new messages, or null on timeout.
+ */
+function waitForMessage(channel, since, timeout_ms) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let watcher = null;
+    let poll = null;
+    let timer = null;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (watcher) watcher.close();
+      if (poll) clearInterval(poll);
+      if (timer) clearTimeout(timer);
+      resolve(result);
+    };
+
+    const check = async () => {
+      try {
+        const all = await readChannel(channel);
+        const newer = all.filter((m) => m.seq > since);
+        if (newer.length) finish(newer);
+      } catch {
+        /* transient read race during append — next tick retries */
+      }
+    };
+
+    // Watch the directory (not the file): the channel file may not exist yet,
+    // and dir-level watch catches both its creation and later appends.
+    try {
+      watcher = fs.watch(DATA_DIR, () => check());
+    } catch {
+      /* fs.watch unsupported here — the safety poll below carries us */
+    }
+    poll = setInterval(check, 2000);
+    timer = setTimeout(() => finish(null), timeout_ms);
+
+    // Fast path: a message may already be waiting before we armed the watcher.
+    check();
+  });
 }
 
 const server = new McpServer({ name: "agent-bridge", version: "1.0.0" });
@@ -132,8 +181,9 @@ server.registerTool(
   {
     title: "Wait for new bridge message",
     description:
-      "Long-poll a channel: returns as soon as a message with seq > since appears, or when timeout_ms elapses. " +
-      "Use this to wait for the other agent's reply without busy-looping. Default timeout 60000ms (max 600000).",
+      "Block until a message with seq > since lands (event-driven — wakes the instant the other agent posts), or until timeout_ms elapses. " +
+      "Default timeout 60000ms (max 600000). " +
+      "WATCH MODE — to get 'triggered' on every message instead of waiting once: after this returns, handle the message(s), optionally bridge_post a reply, then immediately call bridge_wait again with `since` set to the highest seq you just saw. On a timeout (returned=0), just call it again. Keep looping to stay parked on the channel.",
     inputSchema: {
       channel: z.string(),
       since: z.number().int().nonnegative().describe("Return when a message with seq > since exists."),
@@ -141,25 +191,17 @@ server.registerTool(
     },
   },
   async ({ channel, since, timeout_ms = 60000 }) => {
-    const deadline = Date.now() + timeout_ms;
-    const interval = 1000;
-    for (;;) {
-      const all = await readChannel(channel);
-      const newer = all.filter((m) => m.seq > since);
-      if (newer.length) {
-        return {
-          content: [
-            { type: "text", text: JSON.stringify({ channel, since, returned: newer.length, messages: newer }, null, 2) },
-          ],
-        };
-      }
-      if (Date.now() >= deadline) {
-        return {
-          content: [{ type: "text", text: JSON.stringify({ channel, since, returned: 0, timedOut: true, messages: [] }, null, 2) }],
-        };
-      }
-      await sleep(interval);
+    const newer = await waitForMessage(channel, since, timeout_ms);
+    if (newer) {
+      return {
+        content: [
+          { type: "text", text: JSON.stringify({ channel, since, returned: newer.length, messages: newer }, null, 2) },
+        ],
+      };
     }
+    return {
+      content: [{ type: "text", text: JSON.stringify({ channel, since, returned: 0, timedOut: true, messages: [] }, null, 2) }],
+    };
   }
 );
 
