@@ -1,0 +1,9 @@
+{
+  "_comment": "Add this 'agent-bridge' entry to the mcpServers block of BOTH CLIs. Claude Code: ~/.claude.json (or a project .mcp.json). Grok Build: it reads .mcp.json / claude_desktop_config.json with zero reconfiguration. Restart/reconnect each CLI after adding so the bridge_* tools load.",
+  "mcpServers": {
+    "agent-bridge": {
+      "command": "node",
+      "args": ["/Users/prakshaljain/OS-1/agent-bridge/server.js"]
+    }
+  }
+}
